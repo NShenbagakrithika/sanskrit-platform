@@ -1,3 +1,10 @@
-import { completion, config, failure, guard, tutorInstructions, unavailable } from "@/lib/ai-server";
+import { completion, config, tutorInstructions } from "@/lib/ai-server";
+import { learner, failure, json } from "@/lib/api-context";
+import { object, messages, index, readJson, AppError } from "@/lib/validation";
 import { lessons } from "@/lib/course";
-export async function POST(request:Request){const blocked=guard(request);if(blocked)return blocked;if(!config().key)return unavailable();try{if(Number(request.headers.get("content-length")||0)>30000)return Response.json({error:"Message too long."},{status:413});const b:any=await request.json();if(!Array.isArray(b.messages)||b.messages.length<1||b.messages.length>12||b.messages.some((m:any)=>!["user","assistant"].includes(m.role)||typeof m.content!=="string"||m.content.length>3000)||!Number.isInteger(b.lesson)||b.lesson<0||b.lesson>3)return Response.json({error:"Please send a valid lesson question."},{status:400});return Response.json(await completion({model:config().textModel,messages:[{role:"system",content:tutorInstructions+" Current lesson: "+JSON.stringify(lessons[b.lesson])},...b.messages.map((m:any)=>({role:m.role,content:m.content}))],max_completion_tokens:900,store:false}));}catch(e){return failure(e);}}
+export async function POST(request:Request){try{
+ await learner(request,true);const b=object(await readJson(request,64000));
+ const history=messages(b.messages),lesson=index(b.lesson,lessons.length);
+ if(history[history.length-1].role!=="user")throw new AppError(400,"End the conversation with your question.");
+ return json(await completion({model:config().textModel,messages:[{role:"system",content:tutorInstructions+" Current lesson: "+JSON.stringify(lessons[lesson])},...history],max_completion_tokens:900,store:false},request.signal));
+ }catch(e){return failure(e);}}

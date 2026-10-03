@@ -1,11 +1,36 @@
-export async function startRecording(onTime:(n:number)=>void){
+import { encodeWav } from "./wav";
+export async function startRecording(onTime:(n:number)=>void,onLimit:()=>void){
  const stream=await navigator.mediaDevices.getUserMedia({audio:{channelCount:1,echoCancellation:true,noiseSuppression:true}});
- let ctx:AudioContext;
- try{ctx=new AudioContext();await ctx.resume();}catch(e){stream.getTracks().forEach(t=>t.stop());throw e;}
- const source=ctx.createMediaStreamSource(stream),processor=ctx.createScriptProcessor(4096,1,1),gain=ctx.createGain();gain.gain.value=0;
- const chunks:Float32Array[]=[];let count=0,closed=false;source.connect(processor);processor.connect(gain);gain.connect(ctx.destination);
- processor.onaudioprocess=e=>{const a=new Float32Array(e.inputBuffer.getChannelData(0));chunks.push(a);count+=a.length;onTime(count/ctx.sampleRate);};
- return async()=>{if(closed)throw new Error("Recording already stopped");closed=true;processor.disconnect();source.disconnect();gain.disconnect();stream.getTracks().forEach(t=>t.stop());const rate=ctx.sampleRate;await ctx.close();const buf=new ArrayBuffer(44+count*2),v=new DataView(buf);const str=(o:number,s:string)=>{for(let i=0;i<s.length;i++)v.setUint8(o+i,s.charCodeAt(i));};str(0,"RIFF");v.setUint32(4,36+count*2,true);str(8,"WAVE");str(12,"fmt ");v.setUint32(16,16,true);v.setUint16(20,1,true);v.setUint16(22,1,true);v.setUint32(24,rate,true);v.setUint32(28,rate*2,true);v.setUint16(32,2,true);v.setUint16(34,16,true);str(36,"data");v.setUint32(40,count*2,true);let i=44;for(const chunk of chunks)for(const sample of chunk){v.setInt16(i,Math.max(-1,Math.min(1,sample))*(sample<0?32768:32767),true);i+=2;}return new Blob([buf],{type:"audio/wav"});
- }
+ let ctx:AudioContext|undefined,source:MediaStreamAudioSourceNode|undefined,node:AudioWorkletNode|undefined;
+ try{
+ ctx=new AudioContext();await ctx.resume();await ctx.audioWorklet.addModule('/pcm-recorder.js');
+ source=ctx.createMediaStreamSource(stream);node=new AudioWorkletNode(ctx,'pcm-recorder',{numberOfInputs:1,numberOfOutputs:1,channelCount:1});
+ const chunks:Float32Array[]=[];let count=0,stopped=false,resolveFlush:(()=>void)|undefined;
+ const rate=ctx.sampleRate;
+ node.port.onmessage=e=>{if(e.data.samples){chunks.push(e.data.samples);count+=e.data.samples.length;onTime(Math.min(20,count/rate));}
+ if(e.data.stopped)resolveFlush?.();if(e.data.limit)onLimit();};
+ source.connect(node);node.connect(ctx.destination);
+ return async()=>{if(stopped)throw new Error('Recording already stopped.');stopped=true;
+ try{await new Promise<void>(resolve=>{let timeout:ReturnType<typeof setTimeout>;resolveFlush=()=>{clearTimeout(timeout);resolve();};timeout=setTimeout(resolve,200);node!.port.postMessage('stop');});return encodeWav(chunks,rate);}
+ finally{node!.disconnect();source!.disconnect();stream.getTracks().forEach(t=>t.stop());await ctx!.close();}
+ };
+ }catch(e){source?.disconnect();node?.disconnect();stream.getTracks().forEach(t=>t.stop());if(ctx&&ctx.state!=='closed')await ctx.close();throw e;}
 }
 export async function blobBase64(blob:Blob){const bytes=new Uint8Array(await blob.arrayBuffer());let s="";for(let i=0;i<bytes.length;i+=8192)s+=String.fromCharCode(...bytes.subarray(i,i+8192));return btoa(s);}
+
+export async function recordingLevel(blob:Blob){
+ const bytes=await blob.arrayBuffer(),view=new DataView(bytes);let peak=0,sum=0,count=0;
+ for(let i=44;i+1<bytes.byteLength;i+=2){const sample=view.getInt16(i,true)/32768;peak=Math.max(peak,Math.abs(sample));sum+=sample*sample;count++;}
+ return {peak,rms:Math.sqrt(sum/Math.max(1,count))};
+}
+export async function replayRecording(blob:Blob,onEnd:()=>void){
+ const context=new AudioContext();
+ try{await context.resume();const buffer=await context.decodeAudioData(await blob.arrayBuffer());
+ const source=context.createBufferSource(),gain=context.createGain();let peak=0;
+ const samples=buffer.getChannelData(0);for(const sample of samples)peak=Math.max(peak,Math.abs(sample));
+ if(peak<0.001)throw new Error("This recording has no audible microphone signal. Check your input device and record again.");
+ gain.gain.value=Math.min(6,0.8/peak);source.buffer=buffer;source.connect(gain);gain.connect(context.destination);
+ let ended=false;const finish=()=>{if(ended)return;ended=true;void context.close();onEnd();};source.onended=finish;source.start();
+ return ()=>{if(!ended){source.stop();finish();}};
+ }catch(e){await context.close();throw e;}
+}

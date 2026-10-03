@@ -44,3 +44,13 @@ next-env.d.ts
 /.codex/
 /outputs/
 /work/
+
+# Local-only credentials and generated type cache
+.dev.vars*
+*.tsbuildinfo
+
+# Include the blank configuration template, never runtime credentials
+!.env.example
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
